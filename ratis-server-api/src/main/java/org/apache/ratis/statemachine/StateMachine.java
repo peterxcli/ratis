@@ -324,6 +324,39 @@ public interface StateMachine extends Closeable {
     }
 
     /**
+     * Similar to {@link java.nio.channels.GatheringByteChannel#write(ByteBuffer[], int, int)}.
+     *
+     * This is an optional method.
+     * The default implementation writes each buffer using {@link #write(ByteBuffer)}.
+     */
+    default long write(ByteBuffer[] buffers, int offset, int length) throws IOException {
+      if (offset < 0 || length < 0 || length > buffers.length - offset) {
+        throw new IndexOutOfBoundsException("offset=" + offset + ", length=" + length
+            + ", buffers.length=" + buffers.length);
+      }
+
+      long written = 0;
+      for (int i = offset; i < offset + length; i++) {
+        final ByteBuffer buffer = buffers[i];
+        if (!buffer.hasRemaining()) {
+          continue;
+        }
+        final int remaining = buffer.remaining();
+        final int n = write(buffer);
+        written += n;
+        if (n < remaining) {
+          break;
+        }
+      }
+      return written;
+    }
+
+    /** @see #write(ByteBuffer[], int, int) */
+    default long write(ByteBuffer[] buffers) throws IOException {
+      return write(buffers, 0, buffers.length);
+    }
+
+    /**
      * Similar to {@link #write(ByteBuffer)}
      * except that the parameter is a {@link ReferenceCountedObject}.
      *
