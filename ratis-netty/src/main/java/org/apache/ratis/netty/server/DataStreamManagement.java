@@ -22,6 +22,7 @@ import org.apache.ratis.client.RaftClientConfigKeys;
 import org.apache.ratis.client.impl.ClientProtoUtils;
 import org.apache.ratis.client.impl.DataStreamClientImpl.DataStreamOutputImpl;
 import org.apache.ratis.conf.RaftProperties;
+import org.apache.ratis.datastream.impl.DataStreamReplyByteBuf;
 import org.apache.ratis.datastream.impl.DataStreamReplyByteBuffer;
 import org.apache.ratis.datastream.impl.DataStreamRequestByteBuf;
 import org.apache.ratis.io.StandardWriteOption;
@@ -55,6 +56,7 @@ import org.apache.ratis.statemachine.StateMachine.DataStream;
 import org.apache.ratis.statemachine.StateMachine.DataChannel;
 import org.apache.ratis.thirdparty.com.google.common.annotations.VisibleForTesting;
 import org.apache.ratis.thirdparty.io.netty.buffer.ByteBuf;
+import org.apache.ratis.thirdparty.io.netty.buffer.Unpooled;
 import org.apache.ratis.thirdparty.io.netty.channel.ChannelFuture;
 import org.apache.ratis.thirdparty.io.netty.channel.ChannelHandlerContext;
 import org.apache.ratis.thirdparty.io.netty.channel.ChannelId;
@@ -360,17 +362,34 @@ public class DataStreamManagement {
         .build();
   }
 
-  static DataStreamReplyByteBuffer newDataStreamReadOnlyReplyByteBuffer(DataStreamRequestByteBuf request,
-      long streamOffset, ByteBuffer buffer) {
-    final ByteBuffer readOnlyBuffer = buffer.asReadOnlyBuffer();
-    return DataStreamReplyByteBuffer.newBuilder()
+  private static ByteBuffer[] asReadOnlyBuffers(ByteBuffer[] buffers, int offset, int length) {
+    final ByteBuffer[] readOnlyBuffers = new ByteBuffer[length];
+    for (int i = 0; i < length; i++) {
+      readOnlyBuffers[i] = buffers[offset + i].asReadOnlyBuffer();
+    }
+    return readOnlyBuffers;
+  }
+
+  private static int getRemaining(ByteBuffer[] buffers, int offset, int length) {
+    long remaining = 0;
+    for (int i = offset; i < offset + length; i++) {
+      remaining += buffers[i].remaining();
+    }
+    return Math.toIntExact(remaining);
+  }
+
+  static DataStreamReplyByteBuf newDataStreamReadOnlyReplyByteBuf(DataStreamRequestByteBuf request,
+      long streamOffset, ByteBuffer[] buffers, int offset, int length) {
+    final ByteBuffer[] readOnlyBuffers = asReadOnlyBuffers(buffers, offset, length);
+    final ByteBuf data = Unpooled.wrappedBuffer(readOnlyBuffers);
+    return DataStreamReplyByteBuf.newBuilder()
         .setClientId(request.getClientId())
         .setType(Type.STREAM_DATA)
         .setStreamId(request.getStreamId())
         .setStreamOffset(streamOffset)
-        .setBuffer(readOnlyBuffer)
+        .setBuffer(data)
         .setSuccess(true)
-        .setBytesWritten(readOnlyBuffer.remaining())
+        .setBytesWritten(data.readableBytes())
         .build();
   }
 
@@ -593,28 +612,34 @@ public class DataStreamManagement {
 
         @Override
         public synchronized int write(ByteBuffer buffer) throws IOException {
+          return Math.toIntExact(write(new ByteBuffer[]{buffer}, 0, 1));
+        }
+
+        @Override
+        public synchronized long write(ByteBuffer[] buffers, int offset, int length) throws IOException {
           if (!isOpen()) {
             throw new AlreadyClosedException("Channel closed at offset " + streamOffset);
           }
-          final int length = buffer.remaining();
-          final DataStreamReplyByteBuffer reply = newDataStreamReadOnlyReplyByteBuffer(request, streamOffset, buffer);
+          final int dataLength = getRemaining(buffers, offset, length);
+          final DataStreamReplyByteBuf reply =
+              newDataStreamReadOnlyReplyByteBuf(request, streamOffset, buffers, offset, length);
           final ChannelFuture future = ctx.writeAndFlush(reply);
           try {
             future.await();
           } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new InterruptedIOException(
-                "Interrupted while writing " + length + " bytes at offset " + streamOffset);
+                "Interrupted while writing " + dataLength + " bytes at offset " + streamOffset);
           }
           if (!future.isSuccess()) {
             final Throwable cause = future.cause();
             if (cause instanceof IOException) {
               throw (IOException) cause;
             }
-            throw new IOException("Failed to write " + length + " bytes at offset " + streamOffset, cause);
+            throw new IOException("Failed to write " + dataLength + " bytes at offset " + streamOffset, cause);
           }
-          streamOffset += length;
-          return length;
+          streamOffset += dataLength;
+          return dataLength;
         }
       };
       return server.streamReadOnlyAsync(raftClientRequest, readOnlyDataStream)
