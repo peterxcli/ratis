@@ -53,6 +53,7 @@ import org.apache.ratis.thirdparty.io.netty.buffer.Unpooled;
 import org.apache.ratis.thirdparty.io.netty.channel.ChannelHandlerContext;
 import org.apache.ratis.thirdparty.io.netty.channel.ChannelId;
 import org.apache.ratis.thirdparty.io.netty.channel.ChannelInboundHandlerAdapter;
+import org.apache.ratis.thirdparty.io.netty.channel.DefaultChannelId;
 import org.apache.ratis.thirdparty.io.netty.channel.EventLoop;
 import org.apache.ratis.thirdparty.io.netty.channel.EventLoopGroup;
 import org.apache.ratis.thirdparty.io.netty.channel.embedded.EmbeddedChannel;
@@ -665,6 +666,77 @@ class TestDataStreamManagement {
     }
   }
 
+  @Test
+  void channelInactiveCleansUpIdleStream() throws Exception {
+    // The client writes a packet, gets the reply, and then closes the connection without closing the stream.
+    // No request of the stream is in flight when the channel becomes inactive.
+    // The server should still clean up the stream after the grace period.
+    final RaftPeerId serverId = RaftPeerId.valueOf("s1");
+    final ClientId clientId = ClientId.randomId();
+    final RaftGroupId groupId = RaftGroupId.randomId();
+    final long callId = 1L;
+    final TimeDuration gracePeriod = TimeDuration.valueOf(100, TimeUnit.MILLISECONDS);
+
+    final AtomicReference<CountingDataChannel> channelRef = new AtomicReference<>();
+    final CountingDataStreamMap streamMap = new CountingDataStreamMap();
+    final StateMachine stateMachine = newWriteStateMachine(channelRef,
+        Collections.synchronizedList(new ArrayList<>()));
+    final RaftServer.Division division = newWriteDivision(serverId, groupId, stateMachine, streamMap);
+    final RaftServer server = newRaftServer(serverId, new RaftProperties(), groupId, division);
+
+    final NettyServerStreamRpcMetrics metrics = new NettyServerStreamRpcMetrics("s1");
+    final DataStreamManagement management = new DataStreamManagement(server, metrics);
+    final EmbeddedChannel embeddedChannel = newEmbeddedChannel(management, gracePeriod);
+    final ChannelHandlerContext ctx = embeddedChannel.pipeline().firstContext();
+    final CheckedBiFunction<RaftClientRequest, Set<RaftPeer>, Set<DataStreamOutputImpl>, IOException> getStreams =
+        (r, p) -> Collections.emptySet();
+
+    final RaftClientRequest raftClientRequest = RaftClientRequest.newBuilder()
+        .setClientId(clientId)
+        .setServerId(serverId)
+        .setGroupId(groupId)
+        .setCallId(callId)
+        .setType(RaftClientRequest.dataStreamRequestType())
+        .build();
+    final ByteBuffer headerPayload = ClientProtoUtils.toRaftClientRequestProtoByteBuffer(raftClientRequest);
+    final ByteBuf data = Unpooled.wrappedBuffer(new byte[10]);
+
+    try {
+      management.read(newWriteRequest(clientId, Type.STREAM_HEADER, callId, 0,
+          Unpooled.wrappedBuffer(headerPayload), StandardWriteOption.FLUSH), ctx, getStreams);
+      management.read(newWriteRequest(clientId, Type.STREAM_DATA, callId, 0, data, StandardWriteOption.FLUSH),
+          ctx, getStreams);
+      final List<DataStreamReply> replies = drainWriteReplies(embeddedChannel, 2);
+      assertSuccessReply(Type.STREAM_HEADER, 0, replies.get(0));
+      assertSuccessReply(Type.STREAM_DATA, 10, replies.get(1));
+      // The server releases the request when it has finished it.
+      JavaUtils.attempt(() -> assertEquals(0, data.refCnt()), 10,
+          TimeDuration.valueOf(100, TimeUnit.MILLISECONDS), "release data request", null);
+      assertEquals(1, streamMap.liveCount());
+
+      embeddedChannel.close();
+
+      JavaUtils.attempt(() -> {
+        assertFalse(channelRef.get().isOpen(), "DataStream.cleanUp() should be called");
+        assertEquals(0, streamMap.liveCount(), "the DataStreamMap entry should be removed");
+      }, 30, TimeDuration.valueOf(100, TimeUnit.MILLISECONDS), "clean up idle stream", null);
+    } finally {
+      embeddedChannel.finishAndReleaseAll();
+      management.shutdown();
+    }
+  }
+
+  /** The channel calls cleanUpOnChannelInactive when it becomes inactive, like NettyServerStreamRpc. */
+  private static EmbeddedChannel newEmbeddedChannel(DataStreamManagement management, TimeDuration gracePeriod) {
+    // Use a new id since all EmbeddedChannels have the same id by default.
+    return new EmbeddedChannel(DefaultChannelId.newInstance(), new ChannelInboundHandlerAdapter() {
+      @Override
+      public void channelInactive(ChannelHandlerContext ctx) {
+        management.cleanUpOnChannelInactive(ctx.channel().id(), gracePeriod);
+      }
+    });
+  }
+
   /** Mirrors {@link org.apache.ratis.server.impl.DataStreamMapImpl} (a ConcurrentHashMap wrapper) while
    *  exposing the live entry count so a test can observe DataStreamMap leaks. */
   private static final class CountingDataStreamMap implements DataStreamMap {
@@ -748,6 +820,7 @@ class TestDataStreamManagement {
 
               @Override
               public CompletableFuture<?> cleanUp() {
+                channel.close();
                 return CompletableFuture.completedFuture(null);
               }
             };
