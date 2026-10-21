@@ -51,7 +51,6 @@ import org.apache.ratis.server.RaftServerConfigKeys;
 import org.apache.ratis.statemachine.StateMachine;
 import org.apache.ratis.statemachine.StateMachine.DataStream;
 import org.apache.ratis.statemachine.StateMachine.DataChannel;
-import org.apache.ratis.thirdparty.com.google.common.annotations.VisibleForTesting;
 import org.apache.ratis.thirdparty.io.netty.buffer.ByteBuf;
 import org.apache.ratis.thirdparty.io.netty.channel.ChannelHandlerContext;
 import org.apache.ratis.thirdparty.io.netty.channel.ChannelId;
@@ -73,6 +72,7 @@ import java.nio.ByteBuffer;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -202,6 +202,8 @@ public class DataStreamManagement {
     private final Division division;
     private final AtomicReference<CompletableFuture<Void>> previous
         = new AtomicReference<>(CompletableFuture.completedFuture(null));
+    /** The channel of the latest request. */
+    private volatile ChannelId channelId;
 
     StreamInfo(RaftClientRequest request, boolean primary, CompletableFuture<DataStream> stream, Division division,
         CheckedBiFunction<RaftClientRequest, Set<RaftPeer>, Set<DataStreamOutputImpl>, IOException> getStreams,
@@ -224,6 +226,15 @@ public class DataStreamManagement {
 
     AtomicReference<CompletableFuture<Void>> getPrevious() {
       return previous;
+    }
+
+    ChannelId getChannelId() {
+      return channelId;
+    }
+
+    StreamInfo setChannelId(ChannelId channelId) {
+      this.channelId = channelId;
+      return this;
     }
 
     RaftClientRequest getRequest() {
@@ -285,7 +296,6 @@ public class DataStreamManagement {
   private final String name;
 
   private final StreamMap<StreamInfo> streams = new StreamMap<>();
-  private final ChannelMap channels;
   private final ExecutorService requestExecutor;
   private final ExecutorService writeExecutor;
   private final TimeDuration requestTimeout;
@@ -296,7 +306,6 @@ public class DataStreamManagement {
     this.server = server;
     this.name = server.getId() + "-" + JavaUtils.getClassSimpleName(getClass());
 
-    this.channels = new ChannelMap();
     final RaftProperties properties = server.getProperties();
     final boolean useCachedThreadPool = RaftServerConfigKeys.DataStream.asyncRequestThreadPoolCached(properties);
     this.requestExecutor = ConcurrentUtils.newThreadPoolWithMax(useCachedThreadPool,
@@ -480,24 +489,19 @@ public class DataStreamManagement {
     }
   }
 
-  void cleanUp(Set<ClientInvocationId> ids) {
-    for (ClientInvocationId clientInvocationId : ids) {
-      removeDataStream(clientInvocationId);
+  /** Clean up the streams whose latest request came from the given channel. */
+  private void cleanUp(ChannelId channelId) {
+    final Map<ClientInvocationId, StreamInfo> removed = streams.removeIf(s -> channelId.equals(s.getChannelId()));
+    if (!removed.isEmpty()) {
+      LOG.info("{}: Channel {} is inactive, clean up {}", this, channelId, removed.keySet());
+      removed.forEach((id, info) -> info.cleanUp(id));
     }
   }
 
   void cleanUpOnChannelInactive(ChannelId channelId, TimeDuration channelInactiveGracePeriod) {
     // Delayed memory garbage cleanup
-    Optional.ofNullable(channels.remove(channelId)).ifPresent(ids -> {
-      LOG.info("Channel {} is inactive, cleanup clientInvocationIds={}", channelId, ids);
-      TimeoutExecutor.getInstance().onTimeout(channelInactiveGracePeriod, () -> cleanUp(ids),
-          LOG, () -> "Timeout check failed, clientInvocationIds=" + ids);
-    });
-  }
-
-  @VisibleForTesting
-  int getChannelInvocationCount(ChannelId channelId) {
-    return channels.size(channelId);
+    TimeoutExecutor.getInstance().onTimeout(channelInactiveGracePeriod, () -> cleanUp(channelId),
+        LOG, () -> "Failed to clean up the streams of channel " + channelId);
   }
 
   void read(DataStreamRequestByteBuf request, ChannelHandlerContext ctx,
@@ -510,7 +514,6 @@ public class DataStreamManagement {
     } catch (Throwable t) {
       replyDataStreamException(t, request, ctx);
       removeDataStream(key);
-      channels.remove(channelId, key);
     }
   }
 
@@ -526,7 +529,7 @@ public class DataStreamManagement {
    * RATIS-2213: a closed stream's DataStreamMap entry is normally removed by the Raft log worker when the
    * DATASTREAM log entry is linked. If that never happens (the commit is not logged -- e.g. abort, leader
    * change or follower truncation), the entry and the DataStream's Netty buffers would leak: the closed
-   * stream is no longer tracked by {@code streams} or {@code channels}, and the client may keep the channel
+   * stream is no longer tracked by {@code streams}, and the client may keep the channel
    * open (Ozone reuses it), so channel-inactive cleanup cannot reclaim it. Schedule a backstop that reclaims
    * the entry if it is still unlinked after the request timeout. A non-null remove result means the log
    * worker has not linked it, so the DataStream is not yet owned by the state machine and is safe to clean.
@@ -547,13 +550,10 @@ public class DataStreamManagement {
       ClientInvocationId key, ChannelId channelId) {
     final boolean close = request.getWriteOptionList().contains(StandardWriteOption.CLOSE);
 
-    // add to ChannelMap
-    channels.add(channelId, key);
-
     final StreamInfo info;
     if (request.getType() == Type.STREAM_HEADER) {
       final MemoizedSupplier<StreamInfo> supplier = JavaUtils.memoize(
-          () -> newStreamInfo(request.slice(), getStreams));
+          () -> newStreamInfo(request.slice(), getStreams).setChannelId(channelId));
       info = streams.computeIfAbsent(key, id -> supplier.get());
       if (!supplier.isInitialized()) {
         throw new IllegalStateException("Failed to create a new stream for " + request
@@ -564,7 +564,8 @@ public class DataStreamManagement {
       info = Optional.ofNullable(streams.remove(key)).orElseThrow(
           () -> new IllegalStateException("Failed to remove StreamInfo for " + request));
     } else {
-      info = Optional.ofNullable(streams.get(key)).orElseThrow(
+      // Update the channel inside the map, so that it cannot race with cleanUp(ChannelId).
+      info = Optional.ofNullable(streams.computeIfPresent(key, s -> s.setChannelId(channelId))).orElseThrow(
           () -> new IllegalStateException("Failed to get StreamInfo for " + request));
     }
 
@@ -612,7 +613,6 @@ public class DataStreamManagement {
         }
       } finally {
         request.release();
-        channels.remove(channelId, key);
       }
     });
   }
