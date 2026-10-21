@@ -20,6 +20,7 @@ package org.apache.ratis.datastream;
 import org.apache.ratis.BaseTest;
 import org.apache.ratis.client.api.DataStreamInput;
 import org.apache.ratis.io.StandardWriteOption;
+import org.apache.ratis.netty.NettyConfigKeys;
 import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RoutingTable;
 import org.apache.ratis.server.impl.MiniRaftCluster;
@@ -40,7 +41,9 @@ import org.apache.ratis.server.RaftServerConfigKeys;
 import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 import org.apache.ratis.util.CollectionUtils;
 import org.apache.ratis.util.FileUtils;
+import org.apache.ratis.util.JavaUtils;
 import org.apache.ratis.util.ReferenceCountedObject;
+import org.apache.ratis.util.TimeDuration;
 import org.apache.ratis.util.Timestamp;
 import org.apache.ratis.util.function.CheckedConsumer;
 import org.junit.jupiter.api.Assertions;
@@ -50,7 +53,10 @@ import java.io.EOFException;
 import java.io.File;
 import java.nio.channels.FileChannel;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ThreadLocalRandom;
@@ -90,6 +96,43 @@ public abstract class DataStreamClusterTests<CLUSTER extends MiniRaftCluster> ex
   public void testStreamReadOnlyWithNonLeaderPrimary() throws Exception {
     RaftServerConfigKeys.Read.setOption(getProperties(), RaftServerConfigKeys.Read.Option.LINEARIZABLE);
     runWithNewCluster(NUM_SERVERS, this::runTestStreamReadOnlyWithNonLeaderPrimary);
+  }
+
+  @Test
+  public void testIdleStreamCleanUpOnClientClose() throws Exception {
+    final TimeDuration previous = NettyConfigKeys.DataStream.Server.channelInactiveGracePeriod(getProperties());
+    NettyConfigKeys.DataStream.Server.setChannelInactiveGracePeriod(getProperties(), ONE_SECOND);
+    try {
+      runWithNewCluster(NUM_SERVERS, this::runTestIdleStreamCleanUpOnClientClose);
+    } finally {
+      NettyConfigKeys.DataStream.Server.setChannelInactiveGracePeriod(getProperties(), previous);
+    }
+  }
+
+  void runTestIdleStreamCleanUpOnClientClose(CLUSTER cluster) throws Exception {
+    waitForLeader(cluster);
+    final RaftPeer primaryServer = CollectionUtils.random(cluster.getGroup().getPeers());
+    final RaftClientRequest header;
+    try (RaftClient client = cluster.createClient(primaryServer)) {
+      final DataStreamOutputImpl out = (DataStreamOutputImpl) client.getDataStreamApi()
+          .stream(null, getRoutingTable(cluster.getGroup().getPeers(), primaryServer));
+      header = out.getHeader();
+      final DataStreamReply reply = out.writeAsync(DataStreamTestUtils.initBuffer(0, 100),
+          StandardWriteOption.FLUSH).join();
+      DataStreamTestUtils.assertSuccessReply(Type.STREAM_DATA, 100, reply);
+    }
+    // The client is closed, but the stream is not.
+    JavaUtils.attempt(() -> {
+      final List<String> open = new ArrayList<>();
+      for (RaftServer server : cluster.getServers()) {
+        final MultiDataStreamStateMachine stateMachine =
+            (MultiDataStreamStateMachine) server.getDivision(cluster.getGroupId()).getStateMachine();
+        if (stateMachine.getSingleDataStream(header).getDataChannel().isOpen()) {
+          open.add(server.getId() + (server.getId().equals(primaryServer.getId()) ? "(primary)" : ""));
+        }
+      }
+      Assertions.assertEquals(Collections.emptyList(), open, "servers that did not clean up the stream");
+    }, 10, ONE_SECOND, "clean up idle stream", LOG);
   }
 
   void testStreamWrites(CLUSTER cluster) throws Exception {
