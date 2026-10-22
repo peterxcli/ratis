@@ -21,9 +21,13 @@ import org.apache.ratis.protocol.ClientInvocationId;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.function.UnaryOperator;
 
 /**
  * Map: {@link ClientInvocationId} -> {@link STREAM}.
@@ -41,15 +45,31 @@ class StreamMap<STREAM> {
     return info;
   }
 
-  STREAM get(ClientInvocationId key) {
-    final STREAM info = map.get(key);
-    LOG.debug("get({}) returns {}", key, info);
-    return info;
-  }
-
   STREAM remove(ClientInvocationId key) {
     final STREAM info = map.remove(key);
     LOG.debug("remove({}) returns {}", key, info);
     return info;
+  }
+
+  STREAM computeIfPresent(ClientInvocationId key, UnaryOperator<STREAM> function) {
+    final STREAM info = map.computeIfPresent(key, (k, v) -> function.apply(v));
+    LOG.debug("computeIfPresent({}) returns {}", key, info);
+    return info;
+  }
+
+  /** Remove the streams matching the given predicate. */
+  Map<ClientInvocationId, STREAM> removeIf(Predicate<STREAM> predicate) {
+    final Map<ClientInvocationId, STREAM> removed = new HashMap<>();
+    for (ClientInvocationId key : map.keySet()) {
+      map.computeIfPresent(key, (k, v) -> {
+        if (!predicate.test(v)) {
+          return v;
+        }
+        removed.put(k, v);
+        return null;
+      });
+    }
+    LOG.debug("removeIf returns {}", removed.keySet());
+    return removed;
   }
 }
